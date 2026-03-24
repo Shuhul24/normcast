@@ -60,7 +60,7 @@ class KITTIRangeViewDataset(Dataset):
     future_frames one step at a time.
 
     Directory layout expected:
-        <root>/sequences/<seq:02d>/velodyne/*.bin
+        <root>/dataset/sequences/<seq:02d>/velodyne/*.bin
         <root>/poses/<seq:02d>.txt
     """
 
@@ -88,7 +88,7 @@ class KITTIRangeViewDataset(Dataset):
         self.samples: list[tuple[list[str], np.ndarray]] = []
         for seq in sequences:
             sid      = f'{seq:02d}'
-            pc_dir   = os.path.join(root, 'sequences', sid, 'velodyne')
+            pc_dir   = os.path.join(root, 'dataset', 'sequences', sid, 'velodyne')
             pose_f   = os.path.join(root, 'poses', f'{sid}.txt')
             pc_files = sorted(
                 os.path.join(pc_dir, f) for f in os.listdir(pc_dir) if f.endswith('.bin')
