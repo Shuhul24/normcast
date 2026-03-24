@@ -55,7 +55,7 @@ def parse_args():
     p.add_argument('--num_workers', type=int,   default=4)
     p.add_argument('--log_every',   type=int,   default=50)
     p.add_argument('--seed',        type=int,   default=42)
-    p.add_argument('--loss_skip_thresh', type=float, default=1.0,
+    p.add_argument('--loss_skip_thresh', type=float, default=2.0,
                    help='Skip a training batch (and its backward pass) when the '
                         'forward-pass NLL exceeds this value, preventing '
                         'catastrophic-loss batches from corrupting Adam state.')
