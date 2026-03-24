@@ -59,12 +59,22 @@ def parse_args():
                    help='Skip a training batch (and its backward pass) when the '
                         'forward-pass NLL exceeds this value, preventing '
                         'catastrophic-loss batches from corrupting Adam state.')
-    p.add_argument('--logdet_penalty_weight', type=float, default=0.1,
+    p.add_argument('--logdet_penalty_weight', type=float, default=0.0,
                    help='Weight λ for the soft logdet ceiling λ·ReLU(logdet−target). '
-                        'Discourages over-expansive bijections that produce chaotic '
-                        'high-variance samples.  Set to 0 to disable.')
+                        'Disabled by default: the penalty interacts with the affine '
+                        'coupling scale in a way that can cause late-stage collapse '
+                        '(driving z to >>1σ while keeping logdet stable).  Enable '
+                        'cautiously with small values (e.g. 0.05) if logdet grows '
+                        'uncontrollably past epoch ~60.')
     p.add_argument('--logdet_target', type=float, default=2.5,
                    help='Logdet soft-ceiling for the penalty term.')
+    p.add_argument('--cond_dropout_p', type=float, default=0.15,
+                   help='Probability of zeroing the future-frame content fed into '
+                        'each FlowBlock coupling network during training.  Forces '
+                        'scale/shift to be derived from cross-attention to past '
+                        'context, closing the training/sampling gap where the model '
+                        'could otherwise rely on the true future patches (available '
+                        'at training time but not at sampling time).')
     p.add_argument('--context_lr_scale', type=float, default=1.0,
                    help='LR multiplier applied to the context encoder relative to '
                         'the flow blocks.  Values above ~1.2 risk destabilising '
@@ -139,6 +149,7 @@ def main():
         layers_per_block=args.layers_per_block,
         context_layers=args.context_layers,
         head_dim=args.head_dim,
+        cond_dropout_p=args.cond_dropout_p,
     ).to(device)
 
     # Give the context encoder a higher effective LR.  It only receives
@@ -175,6 +186,7 @@ def main():
         )
 
     start_epoch, global_step = 0, 0
+    best_val_nll = math.inf      # tracks the best finite val NLL seen so far
     if args.resume:
         start_epoch, global_step = load_checkpoint(args.resume, model, optimizer)
 
@@ -302,6 +314,14 @@ def main():
               f'val_prior={val_prior:.4f}  '
               f'val_logdet={val_logdet:.4f}'
               + (f'  ({skipped} batches skipped)' if skipped else ''))
+
+        # Persist the best-seen checkpoint permanently (never rolled over).
+        # Protects against late-stage collapse wiping out all good weights.
+        if math.isfinite(val_nll) and val_nll < best_val_nll:
+            best_val_nll = val_nll
+            best_path = args.logdir / 'ckpt_best.pth'
+            save_checkpoint(str(best_path), model, optimizer, epoch + 1, global_step)
+            print(f'[best] val_nll={val_nll:.4f} → {best_path.name}')
 
         new_ckpt = args.logdir / f'ckpt_{epoch:03d}.pth'
         save_checkpoint(str(new_ckpt), model, optimizer, epoch + 1, global_step)

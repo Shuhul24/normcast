@@ -106,12 +106,19 @@ class TransformerLayer(nn.Module):
 class ContextEncoder(nn.Module):
     """Encodes past range-view frames + relative poses into context tokens."""
 
-    def __init__(self, patch_dim: int, channels: int, num_layers: int, head_dim: int):
+    def __init__(self, patch_dim: int, channels: int, num_layers: int,
+                 head_dim: int, num_patches: int):
         super().__init__()
         self.patch_proj = nn.Linear(patch_dim, channels)
         self.pose_proj  = nn.Sequential(
             nn.Linear(6, channels), nn.SiLU(), nn.Linear(channels, channels)
         )
+        # Learnable within-frame spatial positional encoding.
+        # Identical encoding is tiled across all T past frames so the
+        # context encoder can learn spatially-grounded representations
+        # (e.g. "this patch is at the top-left of the range image").
+        # Temporal identity is carried separately by pose_emb.
+        self.spatial_pos = nn.Parameter(torch.zeros(num_patches, channels))
         self.layers = nn.ModuleList(
             [TransformerLayer(channels, head_dim) for _ in range(num_layers)]
         )
@@ -125,6 +132,8 @@ class ContextEncoder(nn.Module):
         N = TN // T
 
         tokens   = self.patch_proj(patches)                            # [B, T*N, C]
+        # Tile the spatial encoding across T frames: [N,C] → [T*N,C]
+        tokens   = tokens + self.spatial_pos.repeat(T, 1)             # [B, T*N, C]
         pose_emb = self.pose_proj(poses_6dof)                         # [B, T, C]
         pose_emb = pose_emb.unsqueeze(2).expand(-1, -1, N, -1)        # [B, T, N, C]
         tokens   = tokens + pose_emb.reshape(B, TN, -1)
@@ -142,9 +151,11 @@ class FlowBlock(nn.Module):
     """
 
     def __init__(self, patch_dim: int, channels: int, num_patches: int,
-                 num_layers: int, head_dim: int, context_dim: int, flip: bool = False):
+                 num_layers: int, head_dim: int, context_dim: int,
+                 flip: bool = False, cond_dropout_p: float = 0.0):
         super().__init__()
-        self.flip = flip
+        self.flip           = flip
+        self.cond_dropout_p = cond_dropout_p
         self.proj_in  = nn.Linear(patch_dim, channels)
         self.pos_embed = nn.Parameter(torch.randn(num_patches, channels) * 1e-2)
         self.layers   = nn.ModuleList(
@@ -161,10 +172,22 @@ class FlowBlock(nn.Module):
 
     def forward(self, x: torch.Tensor,
                 context: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
-        x   = self._flip(x, 1)
+        x    = self._flip(x, 1)
         x_in = x
         pos  = self._flip(self.pos_embed, 0)
-        h    = self.proj_in(x) + pos
+
+        # Conditioning dropout: with probability cond_dropout_p, replace the
+        # future-frame patch content fed into the coupling network with zeros,
+        # so the scale/shift must be derived from cross-attention to past
+        # context alone.  This closes the training/sampling distributional
+        # gap: at sampling time the model only has access to its own (noisy)
+        # predictions, not the true future frame.  The affine coupling itself
+        # (x_in below) is never zeroed — only the network input is masked.
+        if self.training and self.cond_dropout_p > 0.0 and \
+                torch.rand(1, device=x.device).item() < self.cond_dropout_p:
+            h = pos.unsqueeze(0).expand(x.size(0), -1, -1)
+        else:
+            h = self.proj_in(x) + pos
 
         for layer in self.layers:
             h = layer(h, context=context, mask=self.causal_mask)
@@ -216,16 +239,17 @@ class RangeViewFlowModel(nn.Module):
 
     def __init__(
         self,
-        in_channels:      int = 2,
-        img_h:            int = 64,
-        img_w:            int = 2048,
-        patch_h:          int = 4,
-        patch_w:          int = 32,
-        channels:         int = 512,
-        num_flow_blocks:  int = 4,
-        layers_per_block: int = 4,
-        context_layers:   int = 2,
-        head_dim:         int = 64,
+        in_channels:      int   = 2,
+        img_h:            int   = 64,
+        img_w:            int   = 2048,
+        patch_h:          int   = 4,
+        patch_w:          int   = 32,
+        channels:         int   = 512,
+        num_flow_blocks:  int   = 4,
+        layers_per_block: int   = 4,
+        context_layers:   int   = 2,
+        head_dim:         int   = 64,
+        cond_dropout_p:   float = 0.0,
     ):
         super().__init__()
         self.patch_h, self.patch_w = patch_h, patch_w
@@ -234,11 +258,13 @@ class RangeViewFlowModel(nn.Module):
         patch_dim   = in_channels * patch_h * patch_w
         num_patches = (img_h // patch_h) * (img_w // patch_w)
 
-        self.context_encoder = ContextEncoder(patch_dim, channels, context_layers, head_dim)
+        self.context_encoder = ContextEncoder(
+            patch_dim, channels, context_layers, head_dim, num_patches)
 
         self.flow_blocks = nn.ModuleList([
             FlowBlock(patch_dim, channels, num_patches, layers_per_block,
-                      head_dim, context_dim=channels, flip=(i % 2 == 1))
+                      head_dim, context_dim=channels, flip=(i % 2 == 1),
+                      cond_dropout_p=cond_dropout_p)
             for i in range(num_flow_blocks)
         ])
         # (no learned variance buffer — prior is isotropic N(0,I))
