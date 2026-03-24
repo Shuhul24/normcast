@@ -10,6 +10,7 @@ from torch.utils.tensorboard import SummaryWriter
 from dataset import KITTIRangeViewDataset
 from model   import RangeViewFlowModel
 from utils   import cosine_schedule_with_warmup, save_checkpoint, load_checkpoint
+from vis     import visualize_predictions
 
 # -----------------------------------------------------------------------
 # Dequantization noise std (in normalised-depth units).
@@ -61,6 +62,12 @@ def parse_args():
                    help='W&B project name (set to empty string to disable W&B)')
     p.add_argument('--wandb_run',   type=str, default=None,
                    help='Optional W&B run name')
+    # Visualisation
+    p.add_argument('--vis_every',   type=int, default=10,
+                   help='Save prediction visualisations every N epochs '
+                        '(0 = disable).  Saved to <logdir>/vis/')
+    p.add_argument('--vis_futures', type=int, default=3,
+                   help='Number of future steps to visualise (t+1 … t+K)')
     return p.parse_args()
 
 
@@ -264,6 +271,18 @@ def main():
             if old_ckpt.exists():
                 old_ckpt.unlink()
                 print(f'Removed old checkpoint: {old_ckpt.name}')
+
+        # -------------------------------------------------------- visualisation
+        if args.vis_every > 0 and (epoch + 1) % args.vis_every == 0:
+            visualize_predictions(
+                model, val_ds, args,
+                epoch=epoch,
+                device=device,
+                writer=writer,
+                use_wandb=use_wandb,
+                global_step=global_step,
+                num_future=args.vis_futures,
+            )
 
     writer.close()
     if use_wandb:
