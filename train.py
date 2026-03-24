@@ -65,11 +65,11 @@ def parse_args():
                         'high-variance samples.  Set to 0 to disable.')
     p.add_argument('--logdet_target', type=float, default=2.5,
                    help='Logdet soft-ceiling for the penalty term.')
-    p.add_argument('--context_lr_scale', type=float, default=2.0,
+    p.add_argument('--context_lr_scale', type=float, default=1.0,
                    help='LR multiplier applied to the context encoder relative to '
-                        'the flow blocks.  The context encoder receives gradients '
-                        'only through cross-attention, so a higher effective LR '
-                        'compensates for slower convergence.')
+                        'the flow blocks.  Values above ~1.2 risk destabilising '
+                        'training: the context encoder grows faster than the '
+                        'coupling layers can adapt, driving z outside N(0,1).')
     # Paths
     p.add_argument('--logdir',      type=pathlib.Path, default=pathlib.Path('runs/normcast'))
     p.add_argument('--resume',      type=str, default='')
@@ -145,6 +145,9 @@ def main():
     # gradients through cross-attention, so it converges more slowly than
     # the flow coupling blocks.  LambdaLR preserves the LR ratio throughout
     # the cosine schedule because it multiplies each group's base_lr.
+    # NOTE: context_lr_scale > 1 risks destabilising the coupled system if
+    # the context features grow faster than the coupling layers can adapt.
+    # Keep context_lr_scale close to 1.0 (e.g. 1.2) for safety.
     _ctx_param_ids = {id(p) for p in model.context_encoder.parameters()}
     optimizer = torch.optim.AdamW([
         {'params': list(model.context_encoder.parameters()),
