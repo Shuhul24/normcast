@@ -226,10 +226,15 @@ def main():
               f'val_logdet={val_logdet:.4f}'
               + (f'  ({skipped} batches skipped)' if skipped else ''))
 
-        save_checkpoint(
-            str(args.logdir / f'ckpt_{epoch:03d}.pth'),
-            model, optimizer, epoch + 1, global_step,
-        )
+        new_ckpt = args.logdir / f'ckpt_{epoch:03d}.pth'
+        save_checkpoint(str(new_ckpt), model, optimizer, epoch + 1, global_step)
+
+        # Delete the previous epoch's checkpoint to save disk space.
+        if epoch > 0:
+            old_ckpt = args.logdir / f'ckpt_{epoch - 1:03d}.pth'
+            if old_ckpt.exists():
+                old_ckpt.unlink()
+                print(f'Removed old checkpoint: {old_ckpt.name}')
 
     writer.close()
 
