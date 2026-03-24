@@ -1,4 +1,5 @@
 import argparse
+import math
 import pathlib
 
 import torch
@@ -8,6 +9,15 @@ from torch.utils.tensorboard import SummaryWriter
 from dataset import KITTIRangeViewDataset
 from model   import RangeViewFlowModel
 from utils   import cosine_schedule_with_warmup, save_checkpoint, load_checkpoint
+
+# -----------------------------------------------------------------------
+# Dequantization noise std (in normalised-depth units).
+# Adding a small amount of noise before the forward pass prevents the model
+# from finding degenerate "spike" solutions on the discretised LiDAR grid.
+# Applied only to valid (non-zero-depth) pixels so the empty-sky mask is
+# not corrupted.
+# -----------------------------------------------------------------------
+DENOISING_STD = 0.01
 
 
 def parse_args():
@@ -54,6 +64,11 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     torch.manual_seed(args.seed)
     args.logdir.mkdir(parents=True, exist_ok=True)
+
+    # Normalised value that empty-sky / invalid LiDAR pixels are set to.
+    # Used to build the validity mask that excludes these constant regions
+    # from the NLL prior term.
+    invalid_depth: float = -args.depth_mean / args.depth_std   # = -1.0
 
     # ------------------------------------------------------------------ datasets
     train_ds = KITTIRangeViewDataset(
@@ -103,8 +118,10 @@ def main():
         optimizer, warmup_steps=len(train_loader),
         total_steps=total_steps, min_lr=1e-6, max_lr=args.lr,
     )
-    scaler  = torch.amp.GradScaler()
-    writer  = SummaryWriter(args.logdir)
+    # Note: GradScaler is designed for float16 and is not needed with bfloat16.
+    # bfloat16 shares float32's exponent range, so it does not underflow.
+    # We rely on gradient clipping alone for stability.
+    writer = SummaryWriter(args.logdir)
 
     start_epoch, global_step = 0, 0
     if args.resume:
@@ -118,41 +135,96 @@ def main():
             future_frame = batch['future_frames'][:, 0].to(device)  # [B, 2, H, W]
             past_poses   = batch['past_poses'].to(device)           # [B, T, 4, 4]
 
+            # ----------------------------------------------------------
+            # Validity mask — built on float32 data BEFORE autocast so
+            # that the exact-equality check on invalid_depth is reliable.
+            # [B, N, 1]  (1 = patch with at least one valid LiDAR return)
+            # ----------------------------------------------------------
+            valid_mask = model.get_valid_patch_mask(future_frame, invalid_depth)
+
+            # ----------------------------------------------------------
+            # Dequantisation noise — added only to valid pixels to stop
+            # the flow from collapsing to spike solutions on the LiDAR
+            # sampling grid without corrupting the empty-pixel mask.
+            # ----------------------------------------------------------
+            pixel_valid = (future_frame[:, 0:1] != invalid_depth)  # [B,1,H,W]
+            noise       = torch.randn_like(future_frame) * DENOISING_STD
+            future_frame = future_frame + noise * pixel_valid.float()
+
             optimizer.zero_grad()
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                z, logdets = model(future_frame, past_frames, past_poses)
-                loss       = model.get_loss(z, logdets)
+                z, logdets        = model(future_frame, past_frames, past_poses)
+                loss, components  = model.get_loss(z, logdets, valid_mask)
 
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            # Skip batch if numerics are broken (prevents weight corruption).
+            if not torch.isfinite(loss):
+                print(f'[ep {epoch:03d} step {global_step:06d}]  '
+                      f'WARNING: non-finite loss={loss.item():.4f}, skipping batch')
+                optimizer.zero_grad()
+                global_step += 1
+                continue
+
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
             scheduler.step()
 
             if global_step % args.log_every == 0:
                 lr = scheduler.get_last_lr()[0]
-                writer.add_scalar('train/nll', loss.item(), global_step)
-                writer.add_scalar('train/lr',  lr,          global_step)
+                writer.add_scalar('train/nll',      loss.item(),                   global_step)
+                writer.add_scalar('train/prior',    components['prior'].item(),     global_step)
+                writer.add_scalar('train/logdet',   components['logdet'].item(),    global_step)
+                writer.add_scalar('train/grad_norm', grad_norm.item(),              global_step)
+                writer.add_scalar('train/lr',       lr,                            global_step)
                 print(f'[ep {epoch:03d} step {global_step:06d}]  '
-                      f'nll={loss.item():.4f}  lr={lr:.2e}')
+                      f'nll={loss.item():.4f}  '
+                      f'prior={components["prior"].item():.4f}  '
+                      f'logdet={components["logdet"].item():.4f}  '
+                      f'gnorm={grad_norm.item():.3f}  lr={lr:.2e}')
             global_step += 1
 
         # ---------------------------------------------------------------- validation
         model.eval()
-        val_losses = []
+        val_losses, val_priors, val_logdets = [], [], []
+        skipped = 0
         with torch.no_grad():
             for batch in val_loader:
                 past_frames  = batch['past_frames'].to(device)
                 future_frame = batch['future_frames'][:, 0].to(device)
                 past_poses   = batch['past_poses'].to(device)
-                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                    z, logdets = model(future_frame, past_frames, past_poses)
-                    val_losses.append(model.get_loss(z, logdets).item())
 
-        val_nll = sum(val_losses) / len(val_losses)
-        writer.add_scalar('val/nll', val_nll, epoch)
-        print(f'[ep {epoch:03d}]  val_nll={val_nll:.4f}')
+                valid_mask = model.get_valid_patch_mask(future_frame, invalid_depth)
+
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    z, logdets       = model(future_frame, past_frames, past_poses)
+                    loss, components = model.get_loss(z, logdets, valid_mask)
+
+                # Guard: discard batches with non-finite loss so a single
+                # bad sample cannot send the epoch average to ±inf.
+                if not torch.isfinite(loss):
+                    skipped += 1
+                    continue
+
+                val_losses.append(loss.item())
+                val_priors.append(components['prior'].item())
+                val_logdets.append(components['logdet'].item())
+
+        if val_losses:
+            val_nll    = sum(val_losses)  / len(val_losses)
+            val_prior  = sum(val_priors)  / len(val_priors)
+            val_logdet = sum(val_logdets) / len(val_logdets)
+        else:
+            # All batches were non-finite — report NaN as a clear signal.
+            val_nll = val_prior = val_logdet = math.nan
+
+        writer.add_scalar('val/nll',    val_nll,    epoch)
+        writer.add_scalar('val/prior',  val_prior,  epoch)
+        writer.add_scalar('val/logdet', val_logdet, epoch)
+        print(f'[ep {epoch:03d}]  '
+              f'val_nll={val_nll:.4f}  '
+              f'val_prior={val_prior:.4f}  '
+              f'val_logdet={val_logdet:.4f}'
+              + (f'  ({skipped} batches skipped)' if skipped else ''))
 
         save_checkpoint(
             str(args.logdir / f'ckpt_{epoch:03d}.pth'),

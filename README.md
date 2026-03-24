@@ -68,8 +68,45 @@ KITTI split used by default:
 
 ## Installation
 
+### Conda environment (recommended)
+
+The code uses Python 3.10+ syntax (`X | Y` type unions).
+Tested with **Python 3.10 / 3.11** and **PyTorch 2.1+**.
+
+**CUDA 11.8 (Ampere / Volta GPUs — A100, V100, RTX 30xx)**
 ```bash
-pip install torch torchvision tensorboard matplotlib numpy
+conda create -n normcast python=3.10
+conda activate normcast
+conda install pytorch torchvision torchaudio pytorch-cuda=11.8 \
+      -c pytorch -c nvidia
+pip install tensorboard matplotlib numpy
+```
+
+**CUDA 12.1 (Ada Lovelace GPUs — RTX 40xx, H100)**
+```bash
+conda create -n normcast python=3.11
+conda activate normcast
+conda install pytorch torchvision torchaudio pytorch-cuda=12.1 \
+      -c pytorch -c nvidia
+pip install tensorboard matplotlib numpy
+```
+
+**CPU only (no GPU)**
+```bash
+conda create -n normcast python=3.10
+conda activate normcast
+conda install pytorch torchvision torchaudio cpuonly -c pytorch
+pip install tensorboard matplotlib numpy
+```
+
+Verify the installation:
+```bash
+python - <<'EOF'
+import torch, sys
+print(f"Python {sys.version}")
+print(f"PyTorch {torch.__version__}")
+print(f"CUDA available: {torch.cuda.is_available()}")
+EOF
 ```
 
 ---

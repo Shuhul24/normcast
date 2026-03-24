@@ -3,6 +3,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Maximum absolute value for the affine-coupling scale parameter.
+# Clamps exp(-scale) to [exp(-SCALE_CLAMP), exp(SCALE_CLAMP)] ≈ [0.05, 20],
+# preventing runaway volume expansion/contraction that drives NLL to ±∞.
+SCALE_CLAMP = 3.0
+
 
 def rot_to_6dof(poses, ref_poses):
     """
@@ -168,8 +173,9 @@ class FlowBlock(nn.Module):
         out = torch.cat([torch.zeros_like(out[:, :1]), out[:, :-1]], dim=1)
 
         scale, shift = out.chunk(2, dim=-1)
+        scale  = scale.clamp(-SCALE_CLAMP, SCALE_CLAMP)   # prevent ±inf in exp
         z      = (x_in - shift) * (-scale).exp()
-        logdet = -scale.mean(dim=[1, 2])
+        logdet = -scale.mean(dim=[1, 2])                   # per-element mean → [B]
         return self._flip(z, 1), logdet
 
     def _set_sample(self, flag: bool):
@@ -190,8 +196,9 @@ class FlowBlock(nn.Module):
             h  = self.proj_in(xi) + pos[i:i+1]
             for layer in self.layers:
                 h = layer(h, context=context)      # self-attn with KV cache, cross-attn full
-            out         = self.proj_out(h)
+            out          = self.proj_out(h)
             scale, shift = out.chunk(2, dim=-1)
+            scale        = scale.clamp(-SCALE_CLAMP, SCALE_CLAMP)   # must match forward
             x[:, i + 1] = x[:, i + 1] * scale[:, 0].exp() + shift[:, 0]
 
         self._set_sample(False)
@@ -234,7 +241,7 @@ class RangeViewFlowModel(nn.Module):
                       head_dim, context_dim=channels, flip=(i % 2 == 1))
             for i in range(num_flow_blocks)
         ])
-        self.register_buffer('var', torch.ones(num_patches, patch_dim))
+        # (no learned variance buffer — prior is isotropic N(0,I))
 
     # ------------------------------------------------------------------
     # Patch utilities
@@ -253,6 +260,28 @@ class RangeViewFlowModel(nn.Module):
         nh, nw  = self.img_h // ph, self.img_w // pw
         x = x.reshape(B, nh, nw, C, ph, pw)
         return x.permute(0, 3, 1, 4, 2, 5).reshape(B, C, self.img_h, self.img_w)
+
+    def get_valid_patch_mask(self, x: torch.Tensor,
+                             invalid_val: float) -> torch.Tensor:
+        """
+        Build a [B, N, 1] float mask (1 = valid, 0 = empty/invalid) from a
+        range-view frame.  A patch is marked valid when it contains at least
+        one pixel whose depth channel differs from ``invalid_val`` (the
+        normalised value that empty LiDAR pixels are set to).
+
+        Using this mask in get_loss() prevents the model from gaining free
+        log-determinant credit on trivially-constant masked regions.
+        """
+        B, C, H, W = x.shape
+        ph, pw     = self.patch_h, self.patch_w
+        nh, nw     = H // ph, W // pw
+        # pixel-level validity on the depth channel [B, H, W]
+        valid = (x[:, 0] != invalid_val).float()
+        # fold into patch grid [B, nh, nw, ph*pw]
+        valid = valid.reshape(B, nh, ph, nw, pw).permute(0, 1, 3, 2, 4)
+        valid = valid.reshape(B, nh * nw, ph * pw)
+        # patch is valid if ANY pixel inside it is valid → [B, N, 1]
+        return (valid.sum(dim=-1, keepdim=True) > 0).float()
 
     # ------------------------------------------------------------------
     # Context encoding
@@ -283,8 +312,52 @@ class RangeViewFlowModel(nn.Module):
             logdets = logdets + ld
         return z, logdets
 
-    def get_loss(self, z: torch.Tensor, logdets: torch.Tensor) -> torch.Tensor:
-        return 0.5 * z.pow(2).mean() - logdets.mean()
+    def get_loss(
+        self,
+        z:          torch.Tensor,
+        logdets:    torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """
+        Negative log-likelihood under an isotropic Gaussian prior, per dimension.
+
+        NLL/dim = 0.5*(z² + log 2π) − logdet/dim
+
+        The ``0.5*log(2π) ≈ 0.919`` constant (missing in the bare
+        ``0.5*z².mean()`` formula) is included so the reported value matches
+        the standard BPD definition used by TAR-Flow's evaluation code.
+
+        Args:
+            z:          Latent codes,  [B, N, D].
+            logdets:    Accumulated log-determinants (per-dim mean), [B].
+            valid_mask: Optional [B, N, 1] float mask (1=valid LiDAR patch,
+                        0=empty/masked).  When supplied, the prior term is
+                        averaged only over valid patches so the model cannot
+                        gain free logdet credit on constant masked pixels.
+
+        Returns:
+            (loss, components) where components is a dict with detached
+            scalar tensors ``prior``, ``logdet``, and ``loss`` for logging.
+        """
+        LOG2PI     = math.log(2 * math.pi)          # ≈ 1.8379
+        prior_elem = 0.5 * (z.pow(2) + LOG2PI)      # [B, N, D]
+
+        if valid_mask is not None:
+            # valid_mask broadcasts over D; average only over valid patches
+            denom      = (valid_mask.sum() * z.size(-1)).clamp(min=1.0)
+            prior_mean = (prior_elem * valid_mask).sum() / denom
+        else:
+            prior_mean = prior_elem.mean()
+
+        logdet_mean = logdets.mean()
+        loss        = prior_mean - logdet_mean
+
+        components = {
+            'prior':  prior_mean.detach(),
+            'logdet': logdet_mean.detach(),
+            'loss':   loss.detach(),
+        }
+        return loss, components
 
     # ------------------------------------------------------------------
     # Reverse (sampling): z → x̂
@@ -298,7 +371,6 @@ class RangeViewFlowModel(nn.Module):
         N        = (self.img_h // self.patch_h) * (self.img_w // self.patch_w)
         D        = past_frames.size(2) * self.patch_h * self.patch_w
         z        = torch.randn(B, N, D, device=past_frames.device) * temperature
-        z        = z * self.var.sqrt()
         for block in reversed(self.flow_blocks):
             z = block.reverse(z, context)
         return self.unpatchify(z)
