@@ -4,6 +4,7 @@ import pathlib
 
 import torch
 import torch.utils.data
+import wandb
 from torch.utils.tensorboard import SummaryWriter
 
 from dataset import KITTIRangeViewDataset
@@ -54,8 +55,12 @@ def parse_args():
     p.add_argument('--log_every',   type=int,   default=50)
     p.add_argument('--seed',        type=int,   default=42)
     # Paths
-    p.add_argument('--logdir',  type=pathlib.Path, default=pathlib.Path('runs/normcast'))
-    p.add_argument('--resume',  type=str, default='')
+    p.add_argument('--logdir',      type=pathlib.Path, default=pathlib.Path('runs/normcast'))
+    p.add_argument('--resume',      type=str, default='')
+    p.add_argument('--wandb_project', type=str, default='normcast',
+                   help='W&B project name (set to empty string to disable W&B)')
+    p.add_argument('--wandb_run',   type=str, default=None,
+                   help='Optional W&B run name')
     return p.parse_args()
 
 
@@ -123,6 +128,15 @@ def main():
     # We rely on gradient clipping alone for stability.
     writer = SummaryWriter(args.logdir)
 
+    use_wandb = bool(args.wandb_project)
+    if use_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run,
+            config=vars(args),
+            resume='allow',
+        )
+
     start_epoch, global_step = 0, 0
     if args.resume:
         start_epoch, global_step = load_checkpoint(args.resume, model, optimizer)
@@ -176,6 +190,14 @@ def main():
                 writer.add_scalar('train/logdet',   components['logdet'].item(),    global_step)
                 writer.add_scalar('train/grad_norm', grad_norm.item(),              global_step)
                 writer.add_scalar('train/lr',       lr,                            global_step)
+                if use_wandb:
+                    wandb.log({
+                        'train/nll':       loss.item(),
+                        'train/prior':     components['prior'].item(),
+                        'train/logdet':    components['logdet'].item(),
+                        'train/grad_norm': grad_norm.item(),
+                        'train/lr':        lr,
+                    }, step=global_step)
                 print(f'[ep {epoch:03d} step {global_step:06d}]  '
                       f'nll={loss.item():.4f}  '
                       f'prior={components["prior"].item():.4f}  '
@@ -220,6 +242,13 @@ def main():
         writer.add_scalar('val/nll',    val_nll,    epoch)
         writer.add_scalar('val/prior',  val_prior,  epoch)
         writer.add_scalar('val/logdet', val_logdet, epoch)
+        if use_wandb:
+            wandb.log({
+                'val/nll':    val_nll,
+                'val/prior':  val_prior,
+                'val/logdet': val_logdet,
+                'epoch':      epoch,
+            }, step=global_step)
         print(f'[ep {epoch:03d}]  '
               f'val_nll={val_nll:.4f}  '
               f'val_prior={val_prior:.4f}  '
@@ -237,6 +266,8 @@ def main():
                 print(f'Removed old checkpoint: {old_ckpt.name}')
 
     writer.close()
+    if use_wandb:
+        wandb.finish()
 
 
 if __name__ == '__main__':
