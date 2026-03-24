@@ -167,6 +167,7 @@ def visualize_predictions(
     num_future: int = 3,
     bev_range:   float = 50.0,
     scale_h:     int   = 8,
+    temperature: float = 0.7,
 ):
     """
     Pick a random validation sequence, run autoregressive prediction for
@@ -220,7 +221,7 @@ def visualize_predictions(
     with torch.no_grad():
         pred_futures = model.predict_sequence(
             past_frames, past_poses,
-            num_future=num_future, temperature=1.0,
+            num_future=num_future, temperature=temperature,
         )[0].cpu()                                                  # [num_future, 2, H, W]
 
     # ------------------------------------------------------------------

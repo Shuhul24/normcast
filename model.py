@@ -314,30 +314,41 @@ class RangeViewFlowModel(nn.Module):
 
     def get_loss(
         self,
-        z:          torch.Tensor,
-        logdets:    torch.Tensor,
-        valid_mask: torch.Tensor | None = None,
+        z:                     torch.Tensor,
+        logdets:               torch.Tensor,
+        valid_mask:            torch.Tensor | None = None,
+        logdet_penalty_weight: float = 0.0,
+        logdet_target:         float = 2.5,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """
         Negative log-likelihood under an isotropic Gaussian prior, per dimension.
 
-        NLL/dim = 0.5*(z² + log 2π) − logdet/dim
+        NLL/dim = 0.5*(z² + log 2π) − logdet/dim  [+ optional logdet penalty]
 
         The ``0.5*log(2π) ≈ 0.919`` constant (missing in the bare
         ``0.5*z².mean()`` formula) is included so the reported value matches
         the standard BPD definition used by TAR-Flow's evaluation code.
 
         Args:
-            z:          Latent codes,  [B, N, D].
-            logdets:    Accumulated log-determinants (per-dim mean), [B].
-            valid_mask: Optional [B, N, 1] float mask (1=valid LiDAR patch,
-                        0=empty/masked).  When supplied, the prior term is
-                        averaged only over valid patches so the model cannot
-                        gain free logdet credit on constant masked pixels.
+            z:                     Latent codes,  [B, N, D].
+            logdets:               Accumulated log-determinants (per-dim mean), [B].
+            valid_mask:            Optional [B, N, 1] float mask (1=valid LiDAR patch,
+                                   0=empty/masked).  When supplied, the prior term is
+                                   averaged only over valid patches so the model cannot
+                                   gain free logdet credit on constant masked pixels.
+            logdet_penalty_weight: Weight λ for the soft logdet ceiling penalty
+                                   λ·ReLU(logdet − logdet_target).  Set to 0 to
+                                   disable.  A value of ~0.1 gently discourages the
+                                   bijection from becoming arbitrarily expansive,
+                                   which otherwise produces high-variance / chaotic
+                                   samples.
+            logdet_target:         Upper soft-ceiling for the per-dim logdet.
+                                   The penalty is zero when logdet ≤ this value.
 
         Returns:
             (loss, components) where components is a dict with detached
-            scalar tensors ``prior``, ``logdet``, and ``loss`` for logging.
+            scalar tensors ``prior``, ``logdet``, ``logdet_penalty``, and
+            ``loss`` for logging.
         """
         LOG2PI     = math.log(2 * math.pi)          # ≈ 1.8379
         prior_elem = 0.5 * (z.pow(2) + LOG2PI)      # [B, N, D]
@@ -350,12 +361,21 @@ class RangeViewFlowModel(nn.Module):
             prior_mean = prior_elem.mean()
 
         logdet_mean = logdets.mean()
-        loss        = prior_mean - logdet_mean
+
+        # Soft ceiling: penalise logdet > logdet_target to prevent the flow
+        # from becoming over-expansive, which causes high-variance sampling.
+        if logdet_penalty_weight > 0.0:
+            logdet_penalty = logdet_penalty_weight * F.relu(logdet_mean - logdet_target)
+        else:
+            logdet_penalty = logdet_mean.new_zeros(())
+
+        loss = prior_mean - logdet_mean + logdet_penalty
 
         components = {
-            'prior':  prior_mean.detach(),
-            'logdet': logdet_mean.detach(),
-            'loss':   loss.detach(),
+            'prior':          prior_mean.detach(),
+            'logdet':         logdet_mean.detach(),
+            'logdet_penalty': logdet_penalty.detach(),
+            'loss':           loss.detach(),
         }
         return loss, components
 

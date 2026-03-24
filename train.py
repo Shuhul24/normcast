@@ -55,6 +55,21 @@ def parse_args():
     p.add_argument('--num_workers', type=int,   default=4)
     p.add_argument('--log_every',   type=int,   default=50)
     p.add_argument('--seed',        type=int,   default=42)
+    p.add_argument('--loss_skip_thresh', type=float, default=1.0,
+                   help='Skip a training batch (and its backward pass) when the '
+                        'forward-pass NLL exceeds this value, preventing '
+                        'catastrophic-loss batches from corrupting Adam state.')
+    p.add_argument('--logdet_penalty_weight', type=float, default=0.1,
+                   help='Weight λ for the soft logdet ceiling λ·ReLU(logdet−target). '
+                        'Discourages over-expansive bijections that produce chaotic '
+                        'high-variance samples.  Set to 0 to disable.')
+    p.add_argument('--logdet_target', type=float, default=2.5,
+                   help='Logdet soft-ceiling for the penalty term.')
+    p.add_argument('--context_lr_scale', type=float, default=2.0,
+                   help='LR multiplier applied to the context encoder relative to '
+                        'the flow blocks.  The context encoder receives gradients '
+                        'only through cross-attention, so a higher effective LR '
+                        'compensates for slower convergence.')
     # Paths
     p.add_argument('--logdir',      type=pathlib.Path, default=pathlib.Path('runs/normcast'))
     p.add_argument('--resume',      type=str, default='')
@@ -68,6 +83,10 @@ def parse_args():
                         '(0 = disable).  Saved to <logdir>/vis/')
     p.add_argument('--vis_futures', type=int, default=3,
                    help='Number of future steps to visualise (t+1 … t+K)')
+    p.add_argument('--sample_temp', type=float, default=0.7,
+                   help='Sampling temperature used for visualisation. '
+                        'Values < 1.0 reduce prediction variance; '
+                        '0.7 is a good default for a model in mid-training.')
     return p.parse_args()
 
 
@@ -122,9 +141,17 @@ def main():
         head_dim=args.head_dim,
     ).to(device)
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=1e-4
-    )
+    # Give the context encoder a higher effective LR.  It only receives
+    # gradients through cross-attention, so it converges more slowly than
+    # the flow coupling blocks.  LambdaLR preserves the LR ratio throughout
+    # the cosine schedule because it multiplies each group's base_lr.
+    _ctx_param_ids = {id(p) for p in model.context_encoder.parameters()}
+    optimizer = torch.optim.AdamW([
+        {'params': list(model.context_encoder.parameters()),
+         'lr': args.lr * args.context_lr_scale},
+        {'params': [p for p in model.parameters() if id(p) not in _ctx_param_ids],
+         'lr': args.lr},
+    ], betas=(0.9, 0.95), weight_decay=1e-4)
     total_steps = args.epochs * len(train_loader)
     scheduler   = cosine_schedule_with_warmup(
         optimizer, warmup_steps=len(train_loader),
@@ -175,15 +202,22 @@ def main():
             optimizer.zero_grad()
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 z, logdets        = model(future_frame, past_frames, past_poses)
-                loss, components  = model.get_loss(z, logdets, valid_mask)
+                loss, components  = model.get_loss(
+                    z, logdets, valid_mask,
+                    logdet_penalty_weight=args.logdet_penalty_weight,
+                    logdet_target=args.logdet_target,
+                )
 
-            # Skip batch if numerics are broken (prevents weight corruption).
-            if not torch.isfinite(loss):
+            # Skip batch when the forward-pass loss is non-finite OR exceeds
+            # the spike threshold.  Both conditions corrupt Adam's moment
+            # estimates; skipping the *entire* batch (no backward, no step)
+            # is safer than clipping alone.
+            if not torch.isfinite(loss) or loss.item() > args.loss_skip_thresh:
                 print(f'[ep {epoch:03d} step {global_step:06d}]  '
-                      f'WARNING: non-finite loss={loss.item():.4f}, skipping batch')
-                optimizer.zero_grad()
+                      f'WARNING: loss={loss.item():.4f} exceeds threshold '
+                      f'({args.loss_skip_thresh:.1f}), skipping batch')
                 global_step += 1
-                continue
+                continue   # optimizer.zero_grad() was already called above
 
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -192,24 +226,28 @@ def main():
 
             if global_step % args.log_every == 0:
                 lr = scheduler.get_last_lr()[0]
-                writer.add_scalar('train/nll',      loss.item(),                   global_step)
-                writer.add_scalar('train/prior',    components['prior'].item(),     global_step)
-                writer.add_scalar('train/logdet',   components['logdet'].item(),    global_step)
-                writer.add_scalar('train/grad_norm', grad_norm.item(),              global_step)
-                writer.add_scalar('train/lr',       lr,                            global_step)
+                writer.add_scalar('train/nll',            loss.item(),                          global_step)
+                writer.add_scalar('train/prior',          components['prior'].item(),           global_step)
+                writer.add_scalar('train/logdet',         components['logdet'].item(),          global_step)
+                writer.add_scalar('train/logdet_penalty', components['logdet_penalty'].item(),  global_step)
+                writer.add_scalar('train/grad_norm',      grad_norm.item(),                     global_step)
+                writer.add_scalar('train/lr',             lr,                                   global_step)
                 if use_wandb:
                     wandb.log({
-                        'train/nll':       loss.item(),
-                        'train/prior':     components['prior'].item(),
-                        'train/logdet':    components['logdet'].item(),
-                        'train/grad_norm': grad_norm.item(),
-                        'train/lr':        lr,
+                        'train/nll':            loss.item(),
+                        'train/prior':          components['prior'].item(),
+                        'train/logdet':         components['logdet'].item(),
+                        'train/logdet_penalty': components['logdet_penalty'].item(),
+                        'train/grad_norm':      grad_norm.item(),
+                        'train/lr':             lr,
                     }, step=global_step)
+                ld_pen = components['logdet_penalty'].item()
                 print(f'[ep {epoch:03d} step {global_step:06d}]  '
                       f'nll={loss.item():.4f}  '
                       f'prior={components["prior"].item():.4f}  '
                       f'logdet={components["logdet"].item():.4f}  '
-                      f'gnorm={grad_norm.item():.3f}  lr={lr:.2e}')
+                      + (f'ld_pen={ld_pen:.4f}  ' if ld_pen > 0 else '')
+                      + f'gnorm={grad_norm.item():.3f}  lr={lr:.2e}')
             global_step += 1
 
         # ---------------------------------------------------------------- validation
@@ -282,6 +320,7 @@ def main():
                 use_wandb=use_wandb,
                 global_step=global_step,
                 num_future=args.vis_futures,
+                temperature=args.sample_temp,
             )
 
     writer.close()
